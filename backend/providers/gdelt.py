@@ -1,45 +1,12 @@
-# backend/providers/gdelt.py
 from future import annotations
 
-import os
 import json
-import base64
+import os
 from datetime import date as dt_date, datetime
-from typing import Optional
+from typing import Optional, Any, Dict, List
 
 from google.cloud import bigquery
-
-
-class GDELTError(RuntimeError):
-    pass
-
-
-def _make_bq_client(project_id: Optional[str] = None) -> bigquery.Client:
-    """
-    Priority:
-      1) Render env var: GCP_SA_KEY_JSON  (raw JSON string)
-      2) Render env var: GCP_SA_KEY_B64   (base64 encoded JSON)
-      3) Fallback to ADC (local dev / gcloud auth)
-    """
-    key_json = (os.getenv("GCP_SA_KEY_JSON") or "").strip()
-    key_b64 = (os.getenv("GCP_SA_KEY_B64") or "").strip()
-
-    if key_json or key_b64:
-        try:
-            if key_b64 and not key_json:
-                key_json = base64.b64decode(key_b64).decode("utf-8")
-
-            info = json.loads(key_json)
-            # If project_id not explicitly provided, use:
-            #  - env GCP_PROJECT_ID (optional override)
-            #  - else service account's project_id
-            project = project_id or (os.getenv("GCP_PROJECT_ID") or info.get("project_id"))
-            return bigquery.Client.from_service_account_info(info, project=project)
-        except Exception as e:
-            raise GDELTError(f"GCP service account credential load failed: {e}")
-
-    # ADC path (your laptop with gcloud auth)
-    return bigquery.Client(project=project_id)
+from google.oauth2 import service_account
 
 
 def _ticker_regex(ticker: str) -> Optional[str]:
@@ -47,12 +14,6 @@ def _ticker_regex(ticker: str) -> Optional[str]:
     if len(t) < 2:
         return None
 
-    # Finance-specific patterns to avoid matching normal English words (e.g., "spy")
-    # Matches:
-    #   $SPY
-    #   NYSEARCA:SPY / NYSEARCA: SPY / NASDAQ:SPY / NYSE:SPY (etc)
-    #   SPY ETF / SPY stock / SPY shares
-    #   (SPY) or SPY) common in finance headlines
     return (
         rf"(\${t}\b)"
         rf"|((NYSEARCA|NASDAQ|NYSE|AMEX)\s*:\s*{t}\b)"
@@ -63,14 +24,61 @@ def _ticker_regex(ticker: str) -> Optional[str]:
     )
 
 
+_BQ_CLIENT: Optional[bigquery.Client] = None
+
+
+def _get_bigquery_client(project_id: Optional[str] = None) -> bigquery.Client:
+    """
+    Render has no ADC. Use service account JSON from env:
+      - GCP_SA_KEY_JSON: raw JSON string of service account key
+    Falls back to ADC for local dev if env var isn't set.
+    """
+    global _BQ_CLIENT
+    if _BQ_CLIENT is not None:
+        return _BQ_CLIENT
+
+    sa_json = os.getenv("GCP_SA_KEY_JSON", "").strip()
+
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                "GCP_SA_KEY_JSON is set but is not valid JSON. "
+                "On Render, paste the full JSON key exactly (no quotes)."
+            ) from e
+
+        creds = service_account.Credentials.from_service_account_info(info)
+
+        # Use explicit project_id if passed; else prefer env; else use the SA's project_id.
+        effective_project = (
+            project_id
+            or os.getenv("GCP_PROJECT_ID")
+            or info.get("project_id")
+        )
+
+        if not effective_project:
+            raise RuntimeError(
+                "Could not determine GCP project id. "
+                "Set GCP_PROJECT_ID in Render env or ensure the service account JSON contains project_id."
+            )
+
+        _BQ_CLIENT = bigquery.Client(project=effective_project, credentials=creds)
+        return _BQ_CLIENT
+
+    # Local fallback: ADC
+    _BQ_CLIENT = bigquery.Client(project=project_id)
+    return _BQ_CLIENT
+
+
 def get_headlines_for_day_bigquery(
     *,
     day: dt_date | str,
     ticker: str,
     company_name: Optional[str] = None,
     limit: int = 50,
-    project_id: Optional[str] = None,  # None => ADC default project (local); Render uses SA info
-) -> list[dict]:
+    project_id: Optional[str] = None,  # if None => derived from SA JSON or ADC
+) -> List[Dict[str, Any]]:
     # normalize day
     if isinstance(day, dt_date):
         day_str = day.isoformat()
@@ -81,7 +89,7 @@ def get_headlines_for_day_bigquery(
     name_up = (company_name or "").strip().upper() or None
     ticker_pat = _ticker_regex(ticker)
 
-    client = _make_bq_client(project_id=project_id)
+    client = _get_bigquery_client(project_id=project_id)
 
     sql = """
     SELECT
@@ -109,17 +117,13 @@ def get_headlines_for_day_bigquery(
         ]
     )
 
-    # Works with newer bigquery lib versions; if yours doesn't have query_and_wait,
-    # it'll fall back cleanly.
-    try:
-        rows = client.query_and_wait(sql, job_config=job_config)
-    except AttributeError:
-        rows = client.query(sql, job_config=job_config).result()
+    rows = client.query(sql, job_config=job_config).result()
 
-    out: list[dict] = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         pub = r.get("published_at")
-        if not isinstance(pub, datetime):
+
+        if pub is not None and not isinstance(pub, datetime):
             try:
                 pub = datetime.fromisoformat(str(pub))
             except Exception:
@@ -127,9 +131,9 @@ def get_headlines_for_day_bigquery(
 
         out.append(
             {
-                "title": r.get("title") or "","url": r.get("url") or "",
-                "domain": r.get("domain") or "",
-                "published_at": pub,
+                "title": r.get("title") or "",
+                "url": r.get("url") or "",
+                "domain": r.get("domain") or "","published_at": pub,
             }
         )
 
