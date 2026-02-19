@@ -38,3 +38,25 @@ def fetch_quote(ticker: str) -> dict:
         "prev_close": float(data["pc"]) if data.get("pc") is not None else None,
         "quote_ts": quote_ts,
     }
+
+def fetch_profile(ticker: str) -> dict:
+    """
+    Returns normalized profile fields for Symbol table.
+    Finnhub endpoint name is /stock/profile2.
+    """
+    ticker = ticker.upper().strip()
+
+    url = f"{BASE_URL}/stock/profile2"
+    params = {"symbol": ticker, "token": API_KEY}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    p = r.json() or {}
+
+    return {
+        "name": (p.get("name") or "").strip() or None,
+        "exchange": (p.get("exchange") or "").strip() or None,
+        "country": (p.get("country") or "").strip() or None,
+        "currency": (p.get("currency") or "").strip() or None,
+        "mic": (p.get("mic") or "").strip() or None,
+        "type": (p.get("type") or "").strip() or None,  # keep this as "type"
+    }
