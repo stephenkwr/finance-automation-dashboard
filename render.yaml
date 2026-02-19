@@ -1,17 +1,22 @@
 services:
   - type: web
     name: market-news-backend
-    env: python
+    runtime: python
     plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
+    preDeployCommand: alembic upgrade head
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: DATABASE_URL
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
-      - key: MASSIVE_API_KEY
+      - key: GDELT_PROJECT_ID
         sync: false
-      - key: FRONTEND_ORIGINS
-        value: "http://localhost:5173"
+      - key: GDELT_DATASET
+        sync: false
+      - key: GDELT_TABLE
+        sync: false
