@@ -1,9 +1,45 @@
-from __future__ import annotations
+# backend/providers/gdelt.py
+from future import annotations
 
+import os
+import json
+import base64
 from datetime import date as dt_date, datetime
 from typing import Optional
 
 from google.cloud import bigquery
+
+
+class GDELTError(RuntimeError):
+    pass
+
+
+def _make_bq_client(project_id: Optional[str] = None) -> bigquery.Client:
+    """
+    Priority:
+      1) Render env var: GCP_SA_KEY_JSON  (raw JSON string)
+      2) Render env var: GCP_SA_KEY_B64   (base64 encoded JSON)
+      3) Fallback to ADC (local dev / gcloud auth)
+    """
+    key_json = (os.getenv("GCP_SA_KEY_JSON") or "").strip()
+    key_b64 = (os.getenv("GCP_SA_KEY_B64") or "").strip()
+
+    if key_json or key_b64:
+        try:
+            if key_b64 and not key_json:
+                key_json = base64.b64decode(key_b64).decode("utf-8")
+
+            info = json.loads(key_json)
+            # If project_id not explicitly provided, use:
+            #  - env GCP_PROJECT_ID (optional override)
+            #  - else service account's project_id
+            project = project_id or (os.getenv("GCP_PROJECT_ID") or info.get("project_id"))
+            return bigquery.Client.from_service_account_info(info, project=project)
+        except Exception as e:
+            raise GDELTError(f"GCP service account credential load failed: {e}")
+
+    # ADC path (your laptop with gcloud auth)
+    return bigquery.Client(project=project_id)
 
 
 def _ticker_regex(ticker: str) -> Optional[str]:
@@ -33,7 +69,7 @@ def get_headlines_for_day_bigquery(
     ticker: str,
     company_name: Optional[str] = None,
     limit: int = 50,
-    project_id: Optional[str] = None,  # None => ADC default project
+    project_id: Optional[str] = None,  # None => ADC default project (local); Render uses SA info
 ) -> list[dict]:
     # normalize day
     if isinstance(day, dt_date):
@@ -45,7 +81,7 @@ def get_headlines_for_day_bigquery(
     name_up = (company_name or "").strip().upper() or None
     ticker_pat = _ticker_regex(ticker)
 
-    client = bigquery.Client(project=project_id)
+    client = _make_bq_client(project_id=project_id)
 
     sql = """
     SELECT
@@ -53,7 +89,7 @@ def get_headlines_for_day_bigquery(
       url AS url,
       ANY_VALUE(domain) AS domain,
       MAX(date) AS published_at
-    FROM `gdelt-bq.gdeltv2.gal`
+    FROM gdelt-bq.gdeltv2.gal
     WHERE DATE(date) = @day
       AND (
         (@ticker_pat IS NOT NULL AND REGEXP_CONTAINS(UPPER(title), @ticker_pat))
@@ -73,14 +109,17 @@ def get_headlines_for_day_bigquery(
         ]
     )
 
-    rows = client.query_and_wait(sql, job_config=job_config)
+    # Works with newer bigquery lib versions; if yours doesn't have query_and_wait,
+    # it'll fall back cleanly.
+    try:
+        rows = client.query_and_wait(sql, job_config=job_config)
+    except AttributeError:
+        rows = client.query(sql, job_config=job_config).result()
 
     out: list[dict] = []
     for r in rows:
-        # r["published_at"] is a datetime (UTC) from BigQuery
-        pub = r["published_at"]
+        pub = r.get("published_at")
         if not isinstance(pub, datetime):
-            # be defensive, but usually it is datetime
             try:
                 pub = datetime.fromisoformat(str(pub))
             except Exception:
@@ -88,8 +127,7 @@ def get_headlines_for_day_bigquery(
 
         out.append(
             {
-                "title": r.get("title") or "",
-                "url": r.get("url") or "",
+                "title": r.get("title") or "","url": r.get("url") or "",
                 "domain": r.get("domain") or "",
                 "published_at": pub,
             }
