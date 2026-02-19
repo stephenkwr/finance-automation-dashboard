@@ -124,8 +124,6 @@ def dedupe_headlines(items: List[Dict[str, Any]], limit: int = 25) -> List[Dict[
 # -------------------------
 # CORS (local + deployed)
 # -------------------------
-# Set FRONTEND_ORIGINS like:
-#   http://localhost:5173,https://your-frontend.vercel.app
 origins_env = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173")
 allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
 
